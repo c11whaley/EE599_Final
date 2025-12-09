@@ -1,5 +1,35 @@
 # final_full_script_resnet18_combined_ptq_FIXED.py
 import torch
+import platform
+
+# Set quantization engine with fallback for cross-platform compatibility
+supported_engines = torch.backends.quantized.supported_engines
+selected_engine = None
+
+# Try to set the best available engine
+for engine in ['fbgemm', 'qnnpack']:
+    if engine in supported_engines:
+        try:
+            torch.backends.quantized.engine = engine
+            selected_engine = engine
+            print(f"Using quantization engine: {selected_engine}")
+            break
+        except RuntimeError as e:
+            print(f"Warning: Failed to set {engine} engine ({e}). Trying next option...")
+            continue
+
+if not selected_engine and supported_engines:
+    # If fbgemm and qnnpack both failed, use the first available
+    selected_engine = supported_engines[0]
+    try:
+        torch.backends.quantized.engine = selected_engine
+        print(f"Using fallback quantization engine: {selected_engine}")
+    except RuntimeError as e:
+        print(f"Warning: Could not set any quantization engine ({e})")
+
+print(f"Platform: {platform.system()}")
+print(f"Supported quantization engines: {supported_engines}")
+
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
@@ -29,12 +59,18 @@ plt.switch_backend('agg')
 device = torch.device("cpu")
 print(f"Using device for all operations: {device}")
 
-# Directories
-RESULTS_DIR = "experiment_results_cifar10_resnet18"
+# Directories - relative to script location
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RESULTS_DIR = os.path.join(SCRIPT_DIR, "experiment_results_cifar10_resnet18")
 MODELS_DIR = os.path.join(RESULTS_DIR, "models")
 PLOTS_DIR = os.path.join(RESULTS_DIR, "plots")
 METRICS_DIR = os.path.join(RESULTS_DIR, "metrics")
 CHECKPOINT_DIR = os.path.join(RESULTS_DIR, "checkpoints")
+
+# Debug: print script directory on startup
+print(f"Script directory: {SCRIPT_DIR}")
+print(f"Results directory: {RESULTS_DIR}")
+print(f"Checkpoint directory: {CHECKPOINT_DIR}")
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -68,8 +104,12 @@ transform_test = transforms.Compose([
     transforms.Normalize(CIFAR_MEAN, CIFAR_STD)
 ])
 
-trainset = datasets.CIFAR10(".", train=True, download=True, transform=transform_train)
-testset = datasets.CIFAR10(".", train=False, download=True, transform=transform_test)
+# CIFAR-10 data path relative to script
+CIFAR_DATA_DIR = os.path.join(SCRIPT_DIR, "data", "cifar10")
+os.makedirs(CIFAR_DATA_DIR, exist_ok=True)
+
+trainset = datasets.CIFAR10(CIFAR_DATA_DIR, train=True, download=True, transform=transform_train)
+testset = datasets.CIFAR10(CIFAR_DATA_DIR, train=False, download=True, transform=transform_test)
 trainloader = torch.utils.data.DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
 testloader = torch.utils.data.DataLoader(testset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
@@ -101,8 +141,22 @@ def load_checkpoint(model, optimizer, tag):
     filepath = os.path.join(CHECKPOINT_DIR, f'{tag}_best.pth.tar')
     if not os.path.exists(filepath):
         print(f"  [Checkpoint] No checkpoint found for {tag}.")
+        print(f"             Expected at: {filepath}")
+        # List available checkpoints for debugging
+        if os.path.exists(CHECKPOINT_DIR):
+            files = os.listdir(CHECKPOINT_DIR)
+            if files:
+                print(f"             Available checkpoints: {files}")
+            else:
+                print(f"             Checkpoint directory is empty.")
+        else:
+            print(f"             Checkpoint directory does not exist: {CHECKPOINT_DIR}")
         return 0, 0.0
-    checkpoint = torch.load(filepath, map_location=device)
+    try:
+        checkpoint = torch.load(filepath, map_location=device)
+    except Exception as e:
+        print(f"  [Checkpoint] Error loading checkpoint file: {e}")
+        return 0, 0.0
     try:
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -198,54 +252,239 @@ def model_size(model, model_name, debug=False):
     Handles:
     - Regular models: counts 'weight' and 'bias' parameters
     - Pruned models: counts 'weight_orig' and 'bias_orig' (mask doesn't change storage size)
-    - Quantized models: counts quantized weight/bias buffers with appropriate element size
+    - Quantized models: counts quantized weight/bias buffers AND quantization metadata (scales, zero_points)
+    - FX-converted quantized models: traverses GraphModule structure
+    - JIT-scripted quantized models: uses torch.jit internal API to extract parameters
     
     Key insight: For pruned models, the storage size is unchanged because:
     - weight_orig is still float32 (or original dtype)
     - mask is metadata (boolean), typically not serialized with weight
     - When saved to disk, most frameworks only save weight_orig, not masks
     
-    For quantized models, buffers are used for quantized weights (typically int8).
+    For quantized models, buffers include:
+    - weight/bias: quantized parameters (int8)
+    - *_scale_*: quantization scales (float32)
+    - *_zero_point_*: zero points for quantization (int32/int8)
+    - packed_params: packed quantized weights for linear layers
     """
-    def count_bytes(mod, prefix=""):
-        total_bytes = 0
-        
-        # Iterate over named_parameters with recurse=False
-        for name, param in mod.named_parameters(recurse=False):
-            # Count weight_orig/bias_orig for pruned models (these replace weight/bias)
-            if name in ['weight_orig', 'bias_orig']:
-                param_bytes = param.numel() * param.element_size()
-                total_bytes += param_bytes
-                if debug:
-                    print(f"      {prefix}{name} (pruned): {param.numel():,} params × {param.element_size()} bytes = {param_bytes:,} bytes")
-            # Count weight/bias for regular unpruned models
-            elif name in ['weight', 'bias']:
-                param_bytes = param.numel() * param.element_size()
-                total_bytes += param_bytes
-                if debug:
-                    print(f"      {prefix}{name}: {param.numel():,} params × {param.element_size()} bytes = {param_bytes:,} bytes")
-        
-        # For quantized models, check for quantized weight/bias buffers
-        # Note: These are only present if model was converted to quantized format
-        for name, buf in mod.named_buffers(recurse=False):
-            # Skip masks - they're metadata, not serialized with model weights
-            if 'mask' in name:
-                continue
-            # Count quantized weight/bias buffers (typically int8, smaller than float32)
-            if name in ['weight', 'bias'] and isinstance(buf, torch.Tensor):
-                buf_bytes = buf.numel() * buf.element_size()
-                total_bytes += buf_bytes
-                if debug:
-                    print(f"      {prefix}{name} (quantized buffer): {buf.numel():,} params × {buf.element_size()} bytes = {buf_bytes:,} bytes")
-        
-        # Recursively process child modules
-        for subname, submod in mod.named_children():
-            total_bytes += count_bytes(submod, prefix=prefix + subname + ".")
-        
-        return total_bytes
+    def get_element_size(tensor):
+        """Get element size in bytes, with special handling for quantized tensors."""
+        try:
+            return tensor.element_size()
+        except Exception:
+            # For quantized tensors, infer from dtype
+            dtype = getattr(tensor, 'dtype', None)
+            if dtype in (torch.qint8, torch.int8):
+                return 1
+            elif dtype in (torch.qint32,):
+                return 4
+            elif dtype in (torch.int32, torch.float32):
+                return 4
+            elif dtype in (torch.float64,):
+                return 8
+            else:
+                return 4  # default fallback
+    
+    def is_quantization_buffer(name):
+        """Check if a buffer name indicates it's part of quantization metadata."""
+        # Quantization scales end with _scale_ or _scale_0, _scale_1, etc.
+        # Zero points end with _zero_point_ or _zero_point_0, _zero_point_1, etc.
+        # Input scales/zero points: *_input_scale_*, *_input_zero_point_*
+        return ('_scale_' in name or '_zero_point_' in name or 
+                '_input_scale_' in name or '_input_zero_point_' in name or
+                '_weight_scale_' in name or '_weight_zero_point_' in name or
+                name.endswith('_scale') or name.endswith('_zero_point'))
     
     try:
-        total_bytes = count_bytes(model, prefix="")
+        # Check model type
+        is_jit_scripted = isinstance(model, torch.jit.ScriptModule)
+        is_fx = hasattr(model, 'graph')
+        
+        if is_jit_scripted and debug:
+            print(f"    [MODEL_SIZE] Detected JIT-scripted module - using JIT parameter extraction")
+        elif is_fx and debug:
+            print(f"    [MODEL_SIZE] Detected FX GraphModule - using flattened buffer counting")
+        
+        total_bytes = 0
+        
+        # For JIT-scripted modules, try multiple approaches since JIT can be opaque
+        if is_jit_scripted:
+            # Approach 1: Try to get the original FX graph if it's still accessible
+            try:
+                # Get all parameters from JIT module
+                jit_params_found = 0
+                for param in model.parameters():
+                    try:
+                        elem_size = get_element_size(param)
+                        param_bytes = param.numel() * elem_size
+                        total_bytes += param_bytes
+                        jit_params_found += 1
+                        
+                        if debug:
+                            print(f"      JIT param {jit_params_found}: {param.numel():,} elements × {elem_size} bytes = {param_bytes:,} bytes")
+                    except Exception as e:
+                        if debug:
+                            print(f"      JIT param: Error calculating size - {e}")
+                
+                # Get all buffers from JIT module (for scales, zero_points, etc.)
+                jit_bufs_found = 0
+                for buffer in model.buffers():
+                    try:
+                        elem_size = get_element_size(buffer)
+                        buf_bytes = buffer.numel() * elem_size
+                        total_bytes += buf_bytes
+                        jit_bufs_found += 1
+                        
+                        if debug:
+                            print(f"      JIT buffer {jit_bufs_found}: {buffer.numel():,} elements × {elem_size} bytes = {buf_bytes:,} bytes")
+                    except Exception as e:
+                        if debug:
+                            print(f"      JIT buffer: Error calculating size - {e}")
+                
+                if debug:
+                    print(f"    [MODEL_SIZE] JIT extraction found {jit_params_found} params and {jit_bufs_found} buffers")
+                
+                # If we found very little or nothing, try state_dict as fallback for JIT
+                if (jit_params_found + jit_bufs_found) < 5:
+                    if debug:
+                        print(f"    [MODEL_SIZE] JIT extraction found very few items. Trying state_dict for JIT module...")
+                    
+                    try:
+                        state_dict = model.state_dict()
+                        if debug:
+                            print(f"    [MODEL_SIZE] JIT state_dict has {len(state_dict)} entries")
+                        
+                        total_bytes = 0  # Reset and recount via state_dict
+                        for name, param in state_dict.items():
+                            if 'mask' in name or not isinstance(param, torch.Tensor):
+                                continue
+                            
+                            try:
+                                elem_size = get_element_size(param)
+                                param_bytes = param.numel() * elem_size
+                                total_bytes += param_bytes
+                                
+                                if debug:
+                                    print(f"      {name}: {param.numel():,} elements × {elem_size} bytes = {param_bytes:,} bytes")
+                            except Exception as e:
+                                if debug:
+                                    print(f"      {name}: Error - {e}")
+                    except Exception as e2:
+                        if debug:
+                            print(f"    [MODEL_SIZE] JIT state_dict also failed: {e2}")
+            
+            except Exception as e:
+                if debug:
+                    print(f"    [MODEL_SIZE] JIT parameter extraction failed: {e}. Trying state_dict...")
+                
+                try:
+                    state_dict = model.state_dict()
+                    if debug:
+                        print(f"    [MODEL_SIZE] state_dict has {len(state_dict)} entries")
+                    
+                    total_bytes = 0
+                    for name, param in state_dict.items():
+                        if 'mask' in name or not isinstance(param, torch.Tensor):
+                            continue
+                        
+                        try:
+                            elem_size = get_element_size(param)
+                            param_bytes = param.numel() * elem_size
+                            total_bytes += param_bytes
+                            
+                            if debug:
+                                print(f"      {name}: {param.numel():,} elements × {elem_size} bytes = {param_bytes:,} bytes")
+                        except Exception as e:
+                            if debug:
+                                print(f"      {name}: Error - {e}")
+                except Exception as e2:
+                    if debug:
+                        print(f"    [MODEL_SIZE] state_dict fallback also failed: {e2}")
+        
+        # For non-JIT models, use state_dict() which flattens the hierarchy
+        else:
+            try:
+                state_dict = model.state_dict()
+                if debug:
+                    print(f"    [MODEL_SIZE] Found {len(state_dict)} entries in state_dict")
+                
+                for name, param in state_dict.items():
+                    # Skip buffers that are masks or metadata we don't want
+                    if 'mask' in name:
+                        continue
+                    
+                    if not isinstance(param, torch.Tensor):
+                        continue
+                    
+                    try:
+                        elem_size = get_element_size(param)
+                        param_bytes = param.numel() * elem_size
+                        total_bytes += param_bytes
+                        
+                        if debug:
+                            print(f"      {name}: {param.numel():,} elements × {elem_size} bytes = {param_bytes:,} bytes")
+                    except Exception as e:
+                        if debug:
+                            print(f"      {name}: Error calculating size - {e}")
+            except Exception as e:
+                if debug:
+                    print(f"    [MODEL_SIZE] state_dict() approach failed: {e}. Falling back to recursive counting.")
+                
+                # Fallback: recursive module counting
+                def count_bytes_recursive(mod, prefix=""):
+                    module_bytes = 0
+                    
+                    # Collect parameter names to avoid double-counting
+                    param_names = set(name for name, _ in mod.named_parameters(recurse=False))
+                    
+                    # Count direct parameters
+                    for name, param in mod.named_parameters(recurse=False):
+                        try:
+                            param_bytes = param.numel() * get_element_size(param)
+                        except Exception:
+                            param_bytes = param.numel() * 4
+                        module_bytes += param_bytes
+                        if debug:
+                            es = get_element_size(param)
+                            print(f"      {prefix}{name}: {param.numel():,} params × {es} bytes = {param_bytes:,} bytes")
+                    
+                    # Count buffers
+                    for name, buf in mod.named_buffers(recurse=False):
+                        if 'mask' in name or not isinstance(buf, torch.Tensor):
+                            continue
+                        
+                        if name in ['weight', 'bias', 'packed_params'] and name not in param_names:
+                            try:
+                                elem_size = get_element_size(buf)
+                                buf_bytes = buf.numel() * elem_size
+                            except Exception:
+                                buf_bytes = 0
+                                elem_size = 0
+                            
+                            module_bytes += buf_bytes
+                            if debug and buf_bytes > 0:
+                                print(f"      {prefix}{name} (buffer): {buf.numel():,} params × {elem_size} bytes = {buf_bytes:,} bytes")
+                        
+                        elif is_quantization_buffer(name) and name not in param_names:
+                            try:
+                                elem_size = get_element_size(buf)
+                                buf_bytes = buf.numel() * elem_size
+                            except Exception:
+                                buf_bytes = 0
+                                elem_size = 0
+                            
+                            module_bytes += buf_bytes
+                            if debug and buf_bytes > 0:
+                                print(f"      {prefix}{name} (quant metadata): {buf.numel():,} elements × {elem_size} bytes = {buf_bytes:,} bytes")
+                    
+                    # Recursively process child modules
+                    for subname, submod in mod.named_children():
+                        module_bytes += count_bytes_recursive(submod, prefix=prefix + subname + ".")
+                    
+                    return module_bytes
+                
+                total_bytes = count_bytes_recursive(model, prefix="")
+        
         size_mb = total_bytes / 1e6
         if debug:
             print(f"    [MODEL_SIZE] Total: {total_bytes:,} bytes = {size_mb:.4f} MB")
@@ -268,6 +507,7 @@ def param_count(model, debug=False):
     - Regular models: counts 'weight' and 'bias' parameters
     - Pruned models: counts 'weight_orig' and 'bias_orig' (NOT the masks)
     - Quantized models: counts all parameter elements (quantization doesn't reduce param count)
+    - FX-converted quantized models: inspects buffers and packed parameters
     
     Key distinction:
     - Parameter count = number of elements in the tensor
@@ -279,41 +519,52 @@ def param_count(model, debug=False):
     """
     def count_params(mod, prefix=""):
         total = 0
-        
-        # Use named_parameters() to get only trainable parameters
-        # recurse=False means only direct parameters of this module
+
+        # Parameter names local to this module (avoid double-counting buffers)
+        param_names = set(name for name, _ in mod.named_parameters(recurse=False))
+
+        # Count direct parameters
         for name, param in mod.named_parameters(recurse=False):
-            # For pruned models: weight_orig and bias_orig are the parameter tensors
-            # The weight_mask and bias_mask are buffers, not parameters
-            if name in ['weight_orig', 'bias_orig']:
-                num_params = param.numel()
-                total += num_params
+            num_params = param.numel()
+            total += num_params
+            if debug:
+                print(f"      {prefix}{name}: {num_params:,}")
+
+        # Count buffers that represent weights (important for FX-quantized modules)
+        # These include 'weight', 'bias', and 'packed_params' for quantized linear layers
+        for name, buf in mod.named_buffers(recurse=False):
+            if 'mask' in name or not isinstance(buf, torch.Tensor):
+                continue
+            # For weight/bias buffers not represented as parameters
+            if name in ['weight', 'bias'] and name not in param_names:
+                buf_params = buf.numel()
+                total += buf_params
                 if debug:
-                    print(f"      {prefix}{name} (pruned param): {num_params:,}")
-            # For regular unpruned models: weight and bias are parameters
-            elif name in ['weight', 'bias']:
-                num_params = param.numel()
-                total += num_params
-                if debug:
-                    print(f"      {prefix}{name}: {num_params:,}")
-            # Other parameters (batch norm scale/bias, etc.)
-            else:
-                num_params = param.numel()
-                total += num_params
-                if debug:
-                    print(f"      {prefix}{name} (other): {num_params:,}")
-        
-        # IMPORTANT: Do NOT count buffers as parameters
-        # Buffers include:
-        # - Pruning masks (weight_mask, bias_mask) - these are metadata
-        # - Quantization parameters (scale, zero_point) - these are derived from params
-        # - Batch norm statistics (running_mean, running_var) - these are not learnable
-        
+                    print(f"      {prefix}{name} (buffer): {buf_params:,}")
+            # For packed weight buffers in quantized linear/conv layers
+            elif name == 'packed_params' and name not in param_names:
+                # packed_params is a special case - try to extract param count
+                try:
+                    # packed_params doesn't have numel(), but we can inspect it
+                    if hasattr(buf, '__len__'):
+                        buf_params = len(buf)
+                    elif hasattr(buf, 'numel'):
+                        buf_params = buf.numel()
+                    else:
+                        buf_params = 0
+                    if buf_params > 0:
+                        total += buf_params
+                        if debug:
+                            print(f"      {prefix}{name} (packed): {buf_params:,}")
+                except Exception:
+                    if debug:
+                        print(f"      {prefix}{name} (packed): unable to count")
+
         # Recursively count submodules
         for subname, submod in mod.named_children():
             sub_count = count_params(submod, prefix=prefix + subname + ".")
             total += sub_count
-        
+
         return total
     
     total = count_params(model)
@@ -324,66 +575,89 @@ def param_count(model, debug=False):
 
 def count_nonzero_params(model, debug=False):
     """
-    Count non-zero parameters, properly handling pruning masks.
+    Count non-zero parameters, properly handling pruning masks and quantized models.
     For pruned models: applies mask to weight_orig to get actual nonzero count.
     For regular models: counts nonzero in weight directly.
-    For quantized models: counts nonzero in weight buffers.
+    For quantized models: counts nonzero in weight buffers (int8 tensors).
+    For FX-quantized models: handles special buffer formats.
     """
     def count_nonzero(mod, prefix=""):
         nonzero = 0
         total = 0
-        
-        # Check if this module has pruning applied
-        has_pruning = hasattr(mod, 'weight_mask') or hasattr(mod, 'weight_orig')
-        
+
+        # Parameter names for this module
+        param_names = set(name for name, _ in mod.named_parameters(recurse=False))
+
+        # Count parameters and apply pruning masks when present
         for name, param in mod.named_parameters(recurse=False):
-            if name in ['weight_orig', 'bias_orig']:
-                # Pruned parameter - apply mask if available
-                param_total = param.numel()
-                total += param_total
-                
-                if name == 'weight_orig' and hasattr(mod, 'weight_mask'):
-                    # Apply mask to get true nonzero count
-                    masked_weight = param * mod.weight_mask
-                    param_nonzero = torch.count_nonzero(masked_weight).item()
-                elif name == 'bias_orig' and hasattr(mod, 'bias_mask'):
-                    masked_bias = param * mod.bias_mask
-                    param_nonzero = torch.count_nonzero(masked_bias).item()
+            param_total = param.numel()
+            total += param_total
+
+            # If pruned parameter with mask (weight_orig + weight_mask), apply mask
+            if name.endswith('_orig'):
+                mask_name = name.replace('_orig', '_mask')
+                if hasattr(mod, mask_name):
+                    mask = getattr(mod, mask_name)
+                    try:
+                        masked = param * mask
+                        param_nonzero = int(torch.count_nonzero(masked).item())
+                    except Exception:
+                        param_nonzero = int(torch.count_nonzero(param).item())
                 else:
-                    param_nonzero = torch.count_nonzero(param).item()
-                
-                if debug:
-                    print(f"      {prefix}{name}: {param_nonzero:,} / {param_total:,}")
-                nonzero += param_nonzero
-                
-            elif name in ['weight', 'bias'] and not has_pruning:
-                # Regular unpruned parameter
-                param_total = param.numel()
-                total += param_total
-                param_nonzero = torch.count_nonzero(param).item()
-                if debug:
-                    print(f"      {prefix}{name}: {param_nonzero:,} / {param_total:,}")
-                nonzero += param_nonzero
-        
-        # For quantized models, check buffers
+                    param_nonzero = int(torch.count_nonzero(param).item())
+            else:
+                param_nonzero = int(torch.count_nonzero(param).item())
+
+            nonzero += param_nonzero
+            if debug:
+                print(f"      {prefix}{name}: {param_nonzero:,} / {param_total:,}")
+
+        # Count buffers (important for quantized models)
         for name, buf in mod.named_buffers(recurse=False):
-            if name == 'weight_mask' or name == 'bias_mask':
-                # Skip masks, we already used them above
+            if 'mask' in name or not isinstance(buf, torch.Tensor):
                 continue
-            if name in ['weight', 'bias'] and isinstance(buf, torch.Tensor):
+            # Count weight/bias buffers that aren't parameters (quantized weights)
+            if name in ['weight', 'bias'] and name not in param_names:
                 buf_total = buf.numel()
                 total += buf_total
-                buf_nonzero = torch.count_nonzero(buf).item()
+                try:
+                    # Try direct count_nonzero first (works for int8, float32, etc)
+                    buf_nonzero = int(torch.count_nonzero(buf).item())
+                except Exception:
+                    # Fallback: try to get int representation for quantized tensors
+                    try:
+                        if hasattr(buf, 'int_repr'):
+                            buf_nonzero = int(torch.count_nonzero(buf.int_repr()).item())
+                        else:
+                            buf_nonzero = buf_total  # Conservative: assume all non-zero
+                    except Exception:
+                        buf_nonzero = buf_total  # Conservative fallback
+                        
+                nonzero += buf_nonzero
                 if debug:
                     print(f"      {prefix}{name} (buffer): {buf_nonzero:,} / {buf_total:,}")
-                nonzero += buf_nonzero
-        
+            
+            # Handle packed_params for quantized layers
+            elif name == 'packed_params' and name not in param_names:
+                # packed_params are internal PyTorch structures for quantized ops
+                # For counting purposes, treat as fully dense (all non-zero)
+                # This is a conservative estimate
+                try:
+                    if hasattr(buf, '__len__'):
+                        packed_total = len(buf)
+                        total += packed_total
+                        nonzero += packed_total  # Assume all non-zero for packed format
+                        if debug:
+                            print(f"      {prefix}{name} (packed): {packed_total:,} / {packed_total:,}")
+                except Exception:
+                    pass
+
         # Recursively count submodules
         for subname, submod in mod.named_children():
-            sub_nonzero, sub_total = count_nonzero(submod, prefix=prefix+subname+".")
+            sub_nonzero, sub_total = count_nonzero(submod, prefix=prefix + subname + ".")
             nonzero += sub_nonzero
             total += sub_total
-        
+
         return nonzero, total
     
     nonzero, total = count_nonzero(model)
@@ -449,8 +723,30 @@ def apply_global_pruning(model, amount=0.2):
     return model
 
 # FX quant utilities
+def get_fx_quant_backend():
+    """Get appropriate quantization backend based on platform and available engines."""
+    supported = torch.backends.quantized.supported_engines
+    # Prefer fbgemm on x86 platforms (Windows/Linux)
+    if "fbgemm" in supported:
+        return "fbgemm"
+    # Fall back to qnnpack on ARM/Mac
+    elif "qnnpack" in supported:
+        return "qnnpack"
+    # Fall back to default
+    else:
+        print(f"Warning: Using default quantization backend. Supported engines: {supported}")
+        return None
+
 def get_fx_quant_config():
-    qconfig = quant.get_default_qconfig("fbgemm")
+    backend = get_fx_quant_backend()
+    try:
+        if backend:
+            qconfig = quant.get_default_qconfig(backend)
+        else:
+            qconfig = quant.get_default_qconfig("x86")
+    except Exception as e:
+        print(f"Warning: Failed to get qconfig for backend. Using default. Error: {e}")
+        qconfig = quant.QConfig(activation=quant.default_observer, weight=quant.default_weight_observer)
     qconfig_mapping = QConfigMapping().set_global(qconfig)
     return qconfig_mapping
 
@@ -486,7 +782,15 @@ def apply_qat(model, trainloader, criterion, optimizer, epochs, load_if_exists=T
     except Exception as e:
         print(f"  ERROR: Symbolic trace failed. {e}")
         return model_on_cpu, None
-    qat_qconfig = quant.get_default_qat_qconfig("fbgemm")
+    backend = get_fx_quant_backend()
+    try:
+        if backend:
+            qat_qconfig = quant.get_default_qat_qconfig(backend)
+        else:
+            qat_qconfig = quant.get_default_qat_qconfig("x86")
+    except Exception as e:
+        print(f"Warning: Failed to get QAT qconfig. Using default. Error: {e}")
+        qat_qconfig = quant.QConfig(activation=quant.default_observer, weight=quant.default_weight_observer)
     qconfig_mapping = QConfigMapping().set_global(qat_qconfig)
     print(f"  DEBUG: Preparing model for QAT...")
     prepared_model = prepare_qat_fx(graph_module, qconfig_mapping, dummy_input)
@@ -673,14 +977,9 @@ def run_experiments():
     all_histories['qat'] = qat_history
     plot_training_history(qat_history, 'qat', PLOTS_DIR)
 
-    # 6) Combined - FIXED VERSION (Keep pruning masks for sparsity measurement)
-    print("\n" + "="*80 + "\n=== 6. Combined: Structured + PTQ (FIXED) ===\n" + "="*80)
-    combined_model = create_resnet18()
+    # 6) Combined 
+    print("\n" + "="*80 + "\n=== 6. Combined: Structured + PTQ ===\n" + "="*80)
     combined_quant_saved = os.path.join(MODELS_DIR, 'combined_struct_pruned_ptq_scripted.pt')
-    
-    # We need TWO versions:
-    # 1. Pruned version WITH masks for sparsity calculation
-    # 2. Dense quantized version for actual inference
     
     combined_pruned = create_resnet18()
     c_opt = optim.Adam(combined_pruned.parameters(), lr=LEARNING_RATE)
@@ -692,37 +991,42 @@ def run_experiments():
     combined_pruned = apply_structured_pruning(combined_pruned, STRUCT_PRUNE_AMT)
     load_checkpoint(combined_pruned, c_opt, "structured_pruned")
     
-    # Create quantized version
+    # For metrics, we need the pre-JIT FX model, so recreate it
     if os.path.exists(combined_quant_saved):
-        print("  [Combined] Loading existing combined PTQ model.")
-        combined_quantized = torch.jit.load(combined_quant_saved)
-    else:
-        print("  [Combined] Creating dense version for quantization...")
-        dense_model = create_resnet18()
-        dense_model = apply_structured_pruning(dense_model, STRUCT_PRUNE_AMT)
-        load_checkpoint(dense_model, optim.Adam(dense_model.parameters()), "structured_pruned")
-        
-        # Remove masks from dense version for FX compatibility
-        print("  [Combined] Removing pruning masks for FX compatibility...")
-        for name, module in dense_model.named_modules():
-            if hasattr(module, 'weight') and isinstance(module, nn.Conv2d):
-                try: 
-                    prune.remove(module, 'weight')
-                except: 
-                    pass
-        
-        # Quantize the dense version
-        combined_quantized = apply_static_quantization(dense_model, trainloader)
-        torch.jit.save(torch.jit.script(combined_quantized), combined_quant_saved)
+        print("  [Combined] Loading existing combined PTQ model (for JIT storage).")
+        combined_quantized_jit = torch.jit.load(combined_quant_saved)
     
-    # For evaluation, we'll use the quantized version but report sparsity from pruned version
-    combined_model = combined_quantized
+    # Always recreate pre-JIT version for metrics (like we do for PTQ/QAT)
+    print("  [Combined] Creating pre-JIT FX GraphModule for metrics...")
+    dense_model = create_resnet18()
+    dense_model = apply_structured_pruning(dense_model, STRUCT_PRUNE_AMT)
+    load_checkpoint(dense_model, optim.Adam(dense_model.parameters()), "structured_pruned")
+    
+    # Remove masks from dense version for FX compatibility
+    print("  [Combined] Removing pruning masks for FX compatibility...")
+    for name, module in dense_model.named_modules():
+        if hasattr(module, 'weight') and isinstance(module, nn.Conv2d):
+            try: 
+                prune.remove(module, 'weight')
+            except: 
+                pass
+    
+    # Quantize the dense version - this returns FX GraphModule
+    combined_model_for_metrics = apply_static_quantization(dense_model, trainloader)
+    
+    # Save JIT version if it doesn't exist yet
+    if not os.path.exists(combined_quant_saved):
+        print("  [Combined] Saving JIT-scripted version for inference...")
+        torch.jit.save(torch.jit.script(combined_model_for_metrics), combined_quant_saved)
+    
+    # Use pre-JIT FX model for metrics (same pattern as PTQ/QAT)
+    combined_model = combined_model_for_metrics
     combined_pruned_for_sparsity = combined_pruned  # Keep this for sparsity calculation
     
     all_histories['combined'] = all_histories.get('structured_pruned')
     
     # 7) Metrics & Plots - FIXED VERSION
-    print("\n" + "="*80 + "\n=== Collecting Final Metrics (FIXED) ===\n" + "="*80)
+    print("\n" + "="*80 + "\n=== Collecting Final Metrics ===\n" + "="*80)
     
     # Reload models - KEEP pruning masks on pruned models for proper sparsity measurement
     baseline_final = create_resnet18()
@@ -885,16 +1189,6 @@ def run_experiments():
     print(f"- Plots: {PLOTS_DIR}")
     print(f"- Metrics: {METRICS_DIR}")
     print(f"- Checkpoints: {CHECKPOINT_DIR}")
-    print("\nIMPORTANT NOTES:")
-    print("1. Sparsity values should now correctly show ~20% for pruned models")
-    print("2. Parameter counts should be accurate for all model types")
-    print("3. Latency for pruned models may be HIGHER than baseline due to masking overhead")
-    print("4. For actual inference speedup, consider:")
-    print("   - Using sparse tensor formats (torch.sparse)")
-    print("   - Specialized sparse computation libraries (Intel DNNL, NVIDIA cuSPARSE)")
-    print("   - Hardware with native sparse support")
-    print("   - Model export formats that support sparsity (ONNX, TensorRT)")
-    print("="*80)
 
 if __name__ == "__main__":
     run_experiments()
