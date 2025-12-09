@@ -1,4 +1,4 @@
-# final_full_script_resnet18_combined_ptq_fixed.py
+# final_full_script_resnet18_combined_ptq_FIXED.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -192,107 +192,200 @@ def evaluate(model, loader, criterion):
     accuracy = correct / total * 100.0 if total > 0 else 0.0
     return avg_loss, accuracy
 
-def model_size(model, model_name):
+def model_size(model, model_name, debug=False):
     """
-    Calculate model size by summing bytes for actual weights/bias only.
+    Calculate model size in MB by summing bytes of all weight and bias parameters.
+    Handles:
+    - Regular models: counts 'weight' and 'bias' parameters
+    - Pruned models: counts 'weight_orig' and 'bias_orig' (mask doesn't change storage size)
+    - Quantized models: counts quantized weight/bias buffers with appropriate element size
+    
+    Key insight: For pruned models, the storage size is unchanged because:
+    - weight_orig is still float32 (or original dtype)
+    - mask is metadata (boolean), typically not serialized with weight
+    - When saved to disk, most frameworks only save weight_orig, not masks
+    
+    For quantized models, buffers are used for quantized weights (typically int8).
     """
-    def count_bytes(mod):
+    def count_bytes(mod, prefix=""):
         total_bytes = 0
+        
+        # Iterate over named_parameters with recurse=False
         for name, param in mod.named_parameters(recurse=False):
-            if name in ['weight', 'bias']:
-                total_bytes += param.numel() * param.element_size()
+            # Count weight_orig/bias_orig for pruned models (these replace weight/bias)
+            if name in ['weight_orig', 'bias_orig']:
+                param_bytes = param.numel() * param.element_size()
+                total_bytes += param_bytes
+                if debug:
+                    print(f"      {prefix}{name} (pruned): {param.numel():,} params × {param.element_size()} bytes = {param_bytes:,} bytes")
+            # Count weight/bias for regular unpruned models
+            elif name in ['weight', 'bias']:
+                param_bytes = param.numel() * param.element_size()
+                total_bytes += param_bytes
+                if debug:
+                    print(f"      {prefix}{name}: {param.numel():,} params × {param.element_size()} bytes = {param_bytes:,} bytes")
+        
+        # For quantized models, check for quantized weight/bias buffers
+        # Note: These are only present if model was converted to quantized format
         for name, buf in mod.named_buffers(recurse=False):
+            # Skip masks - they're metadata, not serialized with model weights
+            if 'mask' in name:
+                continue
+            # Count quantized weight/bias buffers (typically int8, smaller than float32)
             if name in ['weight', 'bias'] and isinstance(buf, torch.Tensor):
-                total_bytes += buf.numel() * buf.element_size()
-        for _, submod in mod.named_children():
-            total_bytes += count_bytes(submod)
+                buf_bytes = buf.numel() * buf.element_size()
+                total_bytes += buf_bytes
+                if debug:
+                    print(f"      {prefix}{name} (quantized buffer): {buf.numel():,} params × {buf.element_size()} bytes = {buf_bytes:,} bytes")
+        
+        # Recursively process child modules
+        for subname, submod in mod.named_children():
+            total_bytes += count_bytes(submod, prefix=prefix + subname + ".")
+        
         return total_bytes
+    
     try:
-        return count_bytes(model) / 1e6
+        total_bytes = count_bytes(model, prefix="")
+        size_mb = total_bytes / 1e6
+        if debug:
+            print(f"    [MODEL_SIZE] Total: {total_bytes:,} bytes = {size_mb:.4f} MB")
+        return size_mb
     except Exception as e:
         print(f"Error calculating model size: {e}")
+        import traceback
+        traceback.print_exc()
         return 0.0
 
 # ---------------------------------------------------------
-# PARAMETER COUNTING FUNCTIONS - CLEAN IMPLEMENTATION
+# FIXED PARAMETER COUNTING FUNCTIONS
 # ---------------------------------------------------------
 
 def param_count(model, debug=False):
     """
-    Count total parameters in model.
-    For pruned models, only count 'weight' and 'bias' (not 'weight_orig').
-    For quantized models, recursively count buffers named 'weight' and 'bias'.
+    Count total number of parameters in the model.
+    
+    Properly handles:
+    - Regular models: counts 'weight' and 'bias' parameters
+    - Pruned models: counts 'weight_orig' and 'bias_orig' (NOT the masks)
+    - Quantized models: counts all parameter elements (quantization doesn't reduce param count)
+    
+    Key distinction:
+    - Parameter count = number of elements in the tensor
+    - Storage size = param_count × element_size() in bytes
+    - Pruning: doesn't change parameter count, only sparsity (# zeros)
+    - Quantization: doesn't change parameter count, only precision (element_size)
+    
+    Returns: Integer count of total trainable/model parameters
     """
     def count_params(mod, prefix=""):
         total = 0
-        # Parameters
+        
+        # Use named_parameters() to get only trainable parameters
+        # recurse=False means only direct parameters of this module
         for name, param in mod.named_parameters(recurse=False):
-            if name in ['weight', 'bias']:
-                total += param.numel()
+            # For pruned models: weight_orig and bias_orig are the parameter tensors
+            # The weight_mask and bias_mask are buffers, not parameters
+            if name in ['weight_orig', 'bias_orig']:
+                num_params = param.numel()
+                total += num_params
                 if debug:
-                    print(f"      {prefix}{name}: {param.numel():,}")
-        # Buffers (for quantized models)
-        for name, buf in mod.named_buffers(recurse=False):
-            if name in ['weight', 'bias'] and isinstance(buf, torch.Tensor):
-                total += buf.numel()
+                    print(f"      {prefix}{name} (pruned param): {num_params:,}")
+            # For regular unpruned models: weight and bias are parameters
+            elif name in ['weight', 'bias']:
+                num_params = param.numel()
+                total += num_params
                 if debug:
-                    print(f"      {prefix}{name} (buffer): {buf.numel():,}")
+                    print(f"      {prefix}{name}: {num_params:,}")
+            # Other parameters (batch norm scale/bias, etc.)
+            else:
+                num_params = param.numel()
+                total += num_params
+                if debug:
+                    print(f"      {prefix}{name} (other): {num_params:,}")
+        
+        # IMPORTANT: Do NOT count buffers as parameters
+        # Buffers include:
+        # - Pruning masks (weight_mask, bias_mask) - these are metadata
+        # - Quantization parameters (scale, zero_point) - these are derived from params
+        # - Batch norm statistics (running_mean, running_var) - these are not learnable
+        
         # Recursively count submodules
         for subname, submod in mod.named_children():
-            total += count_params(submod, prefix=prefix+subname+".")
+            sub_count = count_params(submod, prefix=prefix + subname + ".")
+            total += sub_count
+        
         return total
+    
     total = count_params(model)
     if debug:
         print(f"    [PARAM_COUNT] Total: {total:,}")
     return total
 
+
 def count_nonzero_params(model, debug=False):
     """
-    Count non-zero parameters considering pruning masks.
-    For pruned models, apply mask if present.
-    For quantized models, recursively count buffers named 'weight' and 'bias'.
+    Count non-zero parameters, properly handling pruning masks.
+    For pruned models: applies mask to weight_orig to get actual nonzero count.
+    For regular models: counts nonzero in weight directly.
+    For quantized models: counts nonzero in weight buffers.
     """
     def count_nonzero(mod, prefix=""):
         nonzero = 0
         total = 0
-        # Parameters
+        
+        # Check if this module has pruning applied
+        has_pruning = hasattr(mod, 'weight_mask') or hasattr(mod, 'weight_orig')
+        
         for name, param in mod.named_parameters(recurse=False):
-            if name in ['weight', 'bias']:
+            if name in ['weight_orig', 'bias_orig']:
+                # Pruned parameter - apply mask if available
                 param_total = param.numel()
                 total += param_total
-                param_nonzero = param_total
-                # For pruned models, apply mask if present
-                mask_attr = f"{name}_mask"
-                if hasattr(mod, mask_attr):
-                    mask = getattr(mod, mask_attr)
-                    if isinstance(mask, torch.Tensor):
-                        masked = param * mask
-                        param_nonzero = torch.count_nonzero(masked).item()
-                        if debug:
-                            print(f"      {prefix}{name}: MASKED -> {param_nonzero:,} / {param_total:,}")
+                
+                if name == 'weight_orig' and hasattr(mod, 'weight_mask'):
+                    # Apply mask to get true nonzero count
+                    masked_weight = param * mod.weight_mask
+                    param_nonzero = torch.count_nonzero(masked_weight).item()
+                elif name == 'bias_orig' and hasattr(mod, 'bias_mask'):
+                    masked_bias = param * mod.bias_mask
+                    param_nonzero = torch.count_nonzero(masked_bias).item()
                 else:
-                    try:
-                        param_nonzero = torch.count_nonzero(param).item()
-                    except:
-                        param_nonzero = param_total
-                    if debug:
-                        print(f"      {prefix}{name}: {param_nonzero:,} / {param_total:,}")
+                    param_nonzero = torch.count_nonzero(param).item()
+                
+                if debug:
+                    print(f"      {prefix}{name}: {param_nonzero:,} / {param_total:,}")
                 nonzero += param_nonzero
-        # Buffers (for quantized models)
+                
+            elif name in ['weight', 'bias'] and not has_pruning:
+                # Regular unpruned parameter
+                param_total = param.numel()
+                total += param_total
+                param_nonzero = torch.count_nonzero(param).item()
+                if debug:
+                    print(f"      {prefix}{name}: {param_nonzero:,} / {param_total:,}")
+                nonzero += param_nonzero
+        
+        # For quantized models, check buffers
         for name, buf in mod.named_buffers(recurse=False):
+            if name == 'weight_mask' or name == 'bias_mask':
+                # Skip masks, we already used them above
+                continue
             if name in ['weight', 'bias'] and isinstance(buf, torch.Tensor):
                 buf_total = buf.numel()
                 total += buf_total
                 buf_nonzero = torch.count_nonzero(buf).item()
-                nonzero += buf_nonzero
                 if debug:
                     print(f"      {prefix}{name} (buffer): {buf_nonzero:,} / {buf_total:,}")
+                nonzero += buf_nonzero
+        
         # Recursively count submodules
         for subname, submod in mod.named_children():
             sub_nonzero, sub_total = count_nonzero(submod, prefix=prefix+subname+".")
             nonzero += sub_nonzero
             total += sub_total
+        
         return nonzero, total
+    
     nonzero, total = count_nonzero(model)
     if debug:
         print(f"    [NONZERO_COUNT] Final: nonzero={nonzero:,}, total={total:,}")
@@ -301,7 +394,19 @@ def count_nonzero_params(model, debug=False):
 # ---------------------------------------------------------
 
 def measure_latency(model, num_samples=1000):
-    """Measure inference latency for single image predictions"""
+    """
+    Measure inference latency for single image predictions.
+    
+    NOTE: Pruned models with masks will likely be SLOWER than baseline because:
+    - PyTorch pruning uses masking (weight = weight_orig * mask)
+    - Full tensor is still stored and computed
+    - Mask multiplication adds overhead
+    
+    To see actual speedup, you need:
+    - Sparse tensor formats
+    - Specialized sparse kernels
+    - Hardware with sparse computation support
+    """
     eval_device = torch.device("cpu")
     model_for_eval = model.to(eval_device)
     model_for_eval.eval()
@@ -568,58 +673,72 @@ def run_experiments():
     all_histories['qat'] = qat_history
     plot_training_history(qat_history, 'qat', PLOTS_DIR)
 
-    # 6) Combined
-    print("\n" + "="*80 + "\n=== 6. Combined: Structured + PTQ ===\n" + "="*80)
+    # 6) Combined - FIXED VERSION (Keep pruning masks for sparsity measurement)
+    print("\n" + "="*80 + "\n=== 6. Combined: Structured + PTQ (FIXED) ===\n" + "="*80)
     combined_model = create_resnet18()
     combined_quant_saved = os.path.join(MODELS_DIR, 'combined_struct_pruned_ptq_scripted.pt')
     
+    # We need TWO versions:
+    # 1. Pruned version WITH masks for sparsity calculation
+    # 2. Dense quantized version for actual inference
+    
+    combined_pruned = create_resnet18()
+    c_opt = optim.Adam(combined_pruned.parameters(), lr=LEARNING_RATE)
+    
+    if not checkpoint_exists("structured_pruned"):
+        raise RuntimeError("Structured pruned checkpoint missing.")
+    
+    # Load pruned model WITH masks (for sparsity measurement)
+    combined_pruned = apply_structured_pruning(combined_pruned, STRUCT_PRUNE_AMT)
+    load_checkpoint(combined_pruned, c_opt, "structured_pruned")
+    
+    # Create quantized version
     if os.path.exists(combined_quant_saved):
         print("  [Combined] Loading existing combined PTQ model.")
-        # For metrics, recreate the pre-JIT model
-        combined_model_for_metrics = create_resnet18()
-        c_opt = optim.Adam(combined_model_for_metrics.parameters(), lr=LEARNING_RATE)
-        combined_model_for_metrics = apply_structured_pruning(combined_model_for_metrics, STRUCT_PRUNE_AMT)
-        load_checkpoint(combined_model_for_metrics, c_opt, "structured_pruned")
-        print("  [Combined] Removing pruning masks for FX compatibility...")
-        for name, module in combined_model_for_metrics.named_modules():
-            if hasattr(module, 'weight') and isinstance(module, nn.Conv2d):
-                try: prune.remove(module, 'weight')
-                except: pass
-        combined_model_for_metrics = apply_static_quantization(combined_model_for_metrics, trainloader)
-        combined_model = combined_model_for_metrics  # Use pre-JIT for metrics
+        combined_quantized = torch.jit.load(combined_quant_saved)
     else:
-        c_opt = optim.Adam(combined_model.parameters(), lr=LEARNING_RATE)
-        if not checkpoint_exists("structured_pruned"):
-            raise RuntimeError("Structured pruned checkpoint missing.")
+        print("  [Combined] Creating dense version for quantization...")
+        dense_model = create_resnet18()
+        dense_model = apply_structured_pruning(dense_model, STRUCT_PRUNE_AMT)
+        load_checkpoint(dense_model, optim.Adam(dense_model.parameters()), "structured_pruned")
         
-        # Apply pruning wrapper, load checkpoint, then remove wrappers (make dense)
-        combined_model = apply_structured_pruning(combined_model, STRUCT_PRUNE_AMT)
-        load_checkpoint(combined_model, c_opt, "structured_pruned")
-        
+        # Remove masks from dense version for FX compatibility
         print("  [Combined] Removing pruning masks for FX compatibility...")
-        for name, module in combined_model.named_modules():
+        for name, module in dense_model.named_modules():
             if hasattr(module, 'weight') and isinstance(module, nn.Conv2d):
-                try: prune.remove(module, 'weight')
-                except: pass
+                try: 
+                    prune.remove(module, 'weight')
+                except: 
+                    pass
         
-        combined_model = apply_static_quantization(combined_model, trainloader)
-        torch.jit.save(torch.jit.script(combined_model), combined_quant_saved)
-
+        # Quantize the dense version
+        combined_quantized = apply_static_quantization(dense_model, trainloader)
+        torch.jit.save(torch.jit.script(combined_quantized), combined_quant_saved)
+    
+    # For evaluation, we'll use the quantized version but report sparsity from pruned version
+    combined_model = combined_quantized
+    combined_pruned_for_sparsity = combined_pruned  # Keep this for sparsity calculation
+    
     all_histories['combined'] = all_histories.get('structured_pruned')
     
-    # 7) Metrics & Plots
-    print("\n" + "="*80 + "\n=== Collecting Final Metrics ===\n" + "="*80)
+    # 7) Metrics & Plots - FIXED VERSION
+    print("\n" + "="*80 + "\n=== Collecting Final Metrics (FIXED) ===\n" + "="*80)
     
-    # Reload standard models from checkpoints for fresh eval
-    baseline_final = create_resnet18(); load_checkpoint(baseline_final, optim.Adam(baseline_final.parameters()), "baseline")
+    # Reload models - KEEP pruning masks on pruned models for proper sparsity measurement
+    baseline_final = create_resnet18()
+    load_checkpoint(baseline_final, optim.Adam(baseline_final.parameters()), "baseline")
     
-    # Structured: load into wrapper, keep wrapper for sparsity check
-    s_final = create_resnet18(); s_final = apply_structured_pruning(s_final, STRUCT_PRUNE_AMT)
+    # Structured: load WITH wrapper to keep masks
+    s_final = create_resnet18()
+    s_final = apply_structured_pruning(s_final, STRUCT_PRUNE_AMT)
     load_checkpoint(s_final, optim.Adam(s_final.parameters()), "structured_pruned")
+    # DON'T remove masks - we need them for sparsity calculation
     
-    # Global: load into wrapper
-    g_final = create_resnet18(); g_final = apply_global_pruning(g_final, GLOBAL_PRUNE_AMT)
+    # Global: load WITH wrapper
+    g_final = create_resnet18()
+    g_final = apply_global_pruning(g_final, GLOBAL_PRUNE_AMT)
     load_checkpoint(g_final, optim.Adam(g_final.parameters()), "global_pruned")
+    # DON'T remove masks - we need them for sparsity calculation
 
     models_dict = {
         "baseline": baseline_final,
@@ -629,6 +748,16 @@ def run_experiments():
         "qat": qat_model,
         "combined": combined_model
     }
+    
+    # Special: track the pruned version of combined for sparsity
+    models_sparsity_dict = {
+        "baseline": baseline_final,
+        "structured_pruned": s_final,
+        "global_pruned": g_final,
+        "ptq": ptq_model,
+        "qat": qat_model,
+        "combined": combined_pruned_for_sparsity  # Use pruned version for sparsity
+    }
 
     for name, model in models_dict.items():
         print(f"\n{'='*80}")
@@ -636,10 +765,13 @@ def run_experiments():
         print(f"{'='*80}")
         print(f"Model type: {type(model).__name__}")
         
+        # Use appropriate model for sparsity calculation
+        model_for_sparsity = models_sparsity_dict[name]
+        
         # Parameter counting
         print(f"\n[PARAMETERS]")
-        total_params = param_count(model, debug=True)
-        nonzero_params, total_check = count_nonzero_params(model, debug=True)
+        total_params = param_count(model_for_sparsity, debug=True)
+        nonzero_params, total_check = count_nonzero_params(model_for_sparsity, debug=True)
         print(f"  Result: total={total_params:,} | nonzero={nonzero_params:,} | total_from_nonzero_fn={total_check:,}")
         
         # Metrics
@@ -655,6 +787,12 @@ def run_experiments():
         
         sparsity = 100.0 * (1.0 - nonzero_params / total_params) if total_params > 0 else 0.0
         print(f"  Sparsity: {sparsity:.2f}%")
+        
+        # Add note about latency for pruned models
+        if 'pruned' in name:
+            print(f"\n  ⚠️  NOTE: Latency may be HIGHER than baseline due to masking overhead.")
+            print(f"      PyTorch pruning uses masking (weight = weight_orig * mask), not removal.")
+            print(f"      For actual speedup, specialized sparse kernels or hardware is needed.")
         
         print(f"\n[SUMMARY]")
         print(f"  params: {total_params:,}")
@@ -677,7 +815,11 @@ def run_experiments():
     df = pd.DataFrame(all_records)
     csv_path = os.path.join(RESULTS_DIR, "model_summary.csv")
     
-    print("\n[CSV WRITE PHASE]")
+    print("\n" + "="*80)
+    print("=== WRITING RESULTS ===")
+    print("="*80)
+    
+    # Try multiple approaches to write CSV
     csv_written = False
     
     # Try 1: Direct write with file removal
@@ -685,9 +827,9 @@ def run_experiments():
         if os.path.exists(csv_path):
             try:
                 os.remove(csv_path)
-                print(f"  Removed existing CSV file: {csv_path}")
+                print(f"  ✓ Removed existing CSV file: {csv_path}")
             except Exception as e:
-                print(f"  Failed to remove CSV: {e}")
+                print(f"  ✗ Failed to remove CSV: {e}")
         
         df.to_csv(csv_path, index=False)
         print(f"  ✓ Successfully wrote CSV to {csv_path}")
@@ -719,14 +861,40 @@ def run_experiments():
             csv_written = True
         except Exception as e:
             print(f"  ✗ Alternative write failed: {e}")
-    print("\n=== Results Summary ===")
+    
+    print("\n" + "="*80)
+    print("=== RESULTS SUMMARY ===")
+    print("="*80)
     print(df.to_string(index=False))
     
-    print("\nGenerating final plots...")
+    print("\n" + "="*80)
+    print("=== GENERATING PLOTS ===")
+    print("="*80)
+    print("Generating comparison plots...")
     plot_comparison(df, PLOTS_DIR)
+    print("Generating efficiency plots...")
     plot_efficiency_metrics(df, PLOTS_DIR)
+    print("Generating training history comparison...")
     plot_all_models_comparison(all_histories, PLOTS_DIR)
-    print("Done.")
+    
+    print("\n" + "="*80)
+    print("=== EXPERIMENT COMPLETE ===")
+    print("="*80)
+    print(f"Results saved to: {RESULTS_DIR}")
+    print(f"- Models: {MODELS_DIR}")
+    print(f"- Plots: {PLOTS_DIR}")
+    print(f"- Metrics: {METRICS_DIR}")
+    print(f"- Checkpoints: {CHECKPOINT_DIR}")
+    print("\nIMPORTANT NOTES:")
+    print("1. Sparsity values should now correctly show ~20% for pruned models")
+    print("2. Parameter counts should be accurate for all model types")
+    print("3. Latency for pruned models may be HIGHER than baseline due to masking overhead")
+    print("4. For actual inference speedup, consider:")
+    print("   - Using sparse tensor formats (torch.sparse)")
+    print("   - Specialized sparse computation libraries (Intel DNNL, NVIDIA cuSPARSE)")
+    print("   - Hardware with native sparse support")
+    print("   - Model export formats that support sparsity (ONNX, TensorRT)")
+    print("="*80)
 
 if __name__ == "__main__":
     run_experiments()
