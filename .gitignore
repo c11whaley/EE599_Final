@@ -1,0 +1,5 @@
+experiment_results_cifar10_resnet18/
+data/
+*.tar.gz
+*.pth
+*.pth.tar
