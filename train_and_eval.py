@@ -1,6 +1,5 @@
 # final_full_script_resnet18_combined_ptq_FIXED.py
 import torch
-
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
@@ -14,12 +13,10 @@ import matplotlib.pyplot as plt
 import warnings
 import datetime
 import shutil
-
-# --- FX IMPORTS ---
 import torch.fx as fx
 from torch.ao.quantization import QConfigMapping
 from torch.ao.quantization.quantize_fx import prepare_fx, prepare_qat_fx, convert_fx 
-# ----------------------
+
 
 warnings.filterwarnings("ignore")
 
@@ -64,7 +61,7 @@ PRUNING_CONFIGS = [
     ('_75pct', 0.75),
 ]
 
-# Default pruning amounts (kept for backward compatibility)
+# Default pruning amounts
 STRUCT_PRUNE_AMT = 0.25
 GLOBAL_PRUNE_AMT = 0.25
 
@@ -166,12 +163,12 @@ def is_training_complete(tag, target_epochs):
     try:
         checkpoint = torch.load(filepath, map_location=device)
         
-        # Check for training_complete flag (new method)
+        # Check for training_complete flag
         if checkpoint.get('training_complete', False):
             print(f"  [Training Status] {tag} marked as complete. Skipping.")
             return True
         
-        # Fallback to epoch-based check for backwards compatibility
+        # Fallback to epoch-based check
         completed_epoch = checkpoint.get('epoch', 0)
         if completed_epoch >= target_epochs:
             print(f"  [Training Status] {tag} already trained for {completed_epoch} epochs (target: {target_epochs}). Skipping.")
@@ -527,7 +524,6 @@ def count_nonzero_params(model, debug=False):
         print(f"    [NONZERO_COUNT] Final: nonzero={nonzero:,}, total={total:,}")
     return nonzero, total
 
-# ---------------------------------------------------------
 
 def measure_latency(model, num_samples=1000):
     """
@@ -800,7 +796,6 @@ def run_experiments():
     
     if os.path.exists(ptq_scripted_path):
         print("  [PTQ] Loading pre-quantized PTQ model.")
-        # For metrics, we need the pre-JIT model, so recreate it
         ptq_model = create_resnet18()
         ptq_opt = optim.Adam(ptq_model.parameters(), lr=LEARNING_RATE)
         _, _ = load_checkpoint(ptq_model, ptq_opt, "baseline")
@@ -1006,12 +1001,6 @@ def run_experiments():
         sparsity = 100.0 * (1.0 - nonzero_params / total_params) if total_params > 0 else 0.0
         print(f"  Sparsity: {sparsity:.2f}%")
         
-        # Add note about latency for pruned models
-        if 'pruned' in name:
-            print(f"\n    NOTE: Latency may be HIGHER than baseline due to masking overhead.")
-            print(f"      PyTorch pruning uses masking (weight = weight_orig * mask), not removal.")
-            print(f"      For actual speedup, specialized sparse kernels or hardware is needed.")
-        
         print(f"\n[SUMMARY]")
         print(f"  params: {total_params:,}")
         print(f"  nonzero_params: {nonzero_params:,}")
@@ -1045,17 +1034,17 @@ def run_experiments():
         if os.path.exists(csv_path):
             try:
                 os.remove(csv_path)
-                print(f"  ✓ Removed existing CSV file: {csv_path}")
+                print(f"Removed existing CSV file: {csv_path}")
             except Exception as e:
-                print(f"  ✗ Failed to remove CSV: {e}")
+                print(f"Failed to remove CSV: {e}")
         
         df.to_csv(csv_path, index=False)
-        print(f"  ✓ Successfully wrote CSV to {csv_path}")
+        print(f"Successfully wrote CSV to {csv_path}")
         csv_written = True
     except PermissionError as e:
-        print(f"  ✗ Permission error: {e}")
+        print(f"Permission error: {e}")
     except Exception as e:
-        print(f"  ✗ Error: {e}")
+        print(f"Error: {e}")
     
     # Try 2: Wait and retry
     if not csv_written:
@@ -1064,10 +1053,10 @@ def run_experiments():
             import time
             time.sleep(1)
             df.to_csv(csv_path, index=False)
-            print(f"  ✓ Successfully wrote CSV on retry")
+            print(f"Successfully wrote CSV on retry")
             csv_written = True
         except Exception as e:
-            print(f"  ✗ Retry failed: {e}")
+            print(f"Retry failed: {e}")
     
     # Try 3: Write to alternative location
     if not csv_written:
@@ -1075,10 +1064,10 @@ def run_experiments():
         print(f"  Attempting to write to alternative location: {alt_csv}")
         try:
             df.to_csv(alt_csv, index=False)
-            print(f"  ✓ Successfully wrote CSV to alternative location: {alt_csv}")
+            print(f"Successfully wrote CSV to alternative location: {alt_csv}")
             csv_written = True
         except Exception as e:
-            print(f"  ✗ Alternative write failed: {e}")
+            print(f"Alternative write failed: {e}")
     
     print("\n" + "="*80)
     print("=== RESULTS SUMMARY ===")
