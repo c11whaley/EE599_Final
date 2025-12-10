@@ -50,14 +50,23 @@ os.makedirs(METRICS_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # Hyperparameters
-EPOCHS_BASELINE = 10
-EPOCHS_PRUNE = 10
-EPOCHS_PTQ = 10
-EPOCHS_QAT = 10
+EPOCHS_BASELINE = 25
+EPOCHS_PRUNE = 25
+EPOCHS_PTQ = 25
+EPOCHS_QAT = 25
 LEARNING_RATE = 0.001
 BATCH_SIZE = 128
-STRUCT_PRUNE_AMT = 0.2
-GLOBAL_PRUNE_AMT = 0.2
+
+# Pruning configurations: (name_suffix, sparsity_amount)
+PRUNING_CONFIGS = [
+    ('_25pct', 0.25),
+    ('_50pct', 0.50),
+    ('_75pct', 0.75),
+]
+
+# Default pruning amounts (kept for backward compatibility)
+STRUCT_PRUNE_AMT = 0.25
+GLOBAL_PRUNE_AMT = 0.25
 
 # CIFAR-10 data loaders
 CIFAR_MEAN = [0.4914, 0.4822, 0.4465]
@@ -95,14 +104,15 @@ def create_resnet18(num_classes=10):
     return model
 
 # Checkpoint utilities
-def save_checkpoint(model, optimizer, epoch, test_acc, tag):
+def save_checkpoint(model, optimizer, epoch, test_acc, tag, training_complete=False):
     model_cpu = model.to(torch.device("cpu"))
     state = {
         'epoch': epoch,
         'model_state_dict': model_cpu.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'best_test_acc': test_acc,
-        'tag': tag
+        'tag': tag,
+        'training_complete': training_complete
     }
     filepath = os.path.join(CHECKPOINT_DIR, f'{tag}_best.pth.tar')
     torch.save(state, filepath)
@@ -142,6 +152,40 @@ def load_checkpoint(model, optimizer, tag):
 def checkpoint_exists(tag):
     filepath = os.path.join(CHECKPOINT_DIR, f'{tag}_best.pth.tar')
     return os.path.exists(filepath)
+
+def is_training_complete(tag, target_epochs):
+    """
+    Check if a model has already completed training for the target number of epochs.
+    Returns True if training is complete, False otherwise.
+    Uses a 'training_complete' flag in the checkpoint for reliable detection.
+    """
+    filepath = os.path.join(CHECKPOINT_DIR, f'{tag}_best.pth.tar')
+    if not os.path.exists(filepath):
+        return False
+    
+    try:
+        checkpoint = torch.load(filepath, map_location=device)
+        
+        # Check for training_complete flag (new method)
+        if checkpoint.get('training_complete', False):
+            print(f"  [Training Status] {tag} marked as complete. Skipping.")
+            return True
+        
+        # Fallback to epoch-based check for backwards compatibility
+        completed_epoch = checkpoint.get('epoch', 0)
+        if completed_epoch >= target_epochs:
+            print(f"  [Training Status] {tag} already trained for {completed_epoch} epochs (target: {target_epochs}). Skipping.")
+            return True
+        else:
+            print(f"  [Training Status] {tag} partially trained ({completed_epoch}/{target_epochs} epochs). Resuming from epoch {completed_epoch + 1}.")
+            return False
+    except Exception as e:
+        print(f"  [Training Status] Error checking checkpoint for {tag}: {e}")
+        return False
+
+def get_checkpoint_tag(base_name, suffix=''):
+    """Generate checkpoint tag with optional suffix."""
+    return f"{base_name}{suffix}" if suffix else base_name
 
 # Training / evaluation utilities
 def train(model, loader, criterion, optimizer, epochs, tag="model", load_if_exists=True):
@@ -186,14 +230,17 @@ def train(model, loader, criterion, optimizer, epochs, tag="model", load_if_exis
         
         if test_acc > best_test_acc:
             best_test_acc = test_acc
-            save_checkpoint(model, optimizer, epoch + 1, best_test_acc, tag)
+            save_checkpoint(model, optimizer, epoch + 1, best_test_acc, tag, training_complete=False)
         
         print(f"[{tag}] Epoch {epoch+1}/{epochs} - Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.2f}% | Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}% (Best: {best_test_acc:.2f}%)")
     
+    # Mark training as complete after all epochs finish
     if best_test_acc > 0.0:
-        print(f"[{tag}] Loading best saved model with accuracy {best_test_acc:.2f}% for final use...")
+        print(f"[{tag}] Training complete! Loading best saved model with accuracy {best_test_acc:.2f}% for final use...")
         dummy_optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
         load_checkpoint(model, dummy_optimizer, tag)
+        # Save completion marker
+        save_checkpoint(model, dummy_optimizer, epochs, best_test_acc, tag, training_complete=True)
         
     return model, history
 
@@ -678,59 +725,89 @@ def run_experiments():
 
     # 1) Baseline
     print("\n" + "="*80 + "\n=== 1. Baseline (FP32) ===\n" + "="*80)
-    baseline = create_resnet18()
-    optimizer = optim.Adam(baseline.parameters(), lr=LEARNING_RATE)
-    baseline, baseline_history = train(baseline, trainloader, criterion, optimizer, EPOCHS_BASELINE, tag="baseline", load_if_exists=True)
+    if is_training_complete("baseline", EPOCHS_BASELINE):
+        baseline = create_resnet18()
+        load_checkpoint(baseline, optim.Adam(baseline.parameters(), lr=LEARNING_RATE), "baseline")
+        try: baseline_history = pd.read_csv(os.path.join(METRICS_DIR, 'baseline_metrics.csv')).to_dict(orient='list')
+        except: baseline_history = None
+    else:
+        baseline = create_resnet18()
+        optimizer = optim.Adam(baseline.parameters(), lr=LEARNING_RATE)
+        baseline, baseline_history = train(baseline, trainloader, criterion, optimizer, EPOCHS_BASELINE, tag="baseline", load_if_exists=True)
+        if baseline_history:
+            pd.DataFrame(baseline_history).to_csv(os.path.join(METRICS_DIR, 'baseline_metrics.csv'), index=False)
     all_histories['baseline'] = baseline_history
-    pd.DataFrame(baseline_history).to_csv(os.path.join(METRICS_DIR, 'baseline_metrics.csv'), index=False)
-    plot_training_history(baseline_history, 'baseline', PLOTS_DIR)
+    if baseline_history:
+        plot_training_history(baseline_history, 'baseline', PLOTS_DIR)
 
-    # 2) Structured Pruning
+    # 2) Structured Pruning - Multiple Sparsity Levels
     print("\n" + "="*80 + "\n=== 2. Structured Pruning ===\n" + "="*80)
-    s_model = create_resnet18()
-    s_optimizer = optim.Adam(s_model.parameters(), lr=LEARNING_RATE)
-    _, _ = load_checkpoint(s_model, s_optimizer, "baseline")
-    s_model = apply_structured_pruning(s_model, STRUCT_PRUNE_AMT)
-    if checkpoint_exists("structured_pruned"):
-        load_checkpoint(s_model, s_optimizer, "structured_pruned")
-        try: s_history = pd.read_csv(os.path.join(METRICS_DIR, 'structured_pruned_metrics.csv')).to_dict(orient='list')
-        except: s_history = None
-    else:
-        s_model, s_history = train(s_model, trainloader, criterion, s_optimizer, EPOCHS_PRUNE, tag="structured_pruned", load_if_exists=False)
-        pd.DataFrame(s_history).to_csv(os.path.join(METRICS_DIR, 'structured_pruned_metrics.csv'), index=False)
-    all_histories['structured_pruned'] = s_history
-    plot_training_history(s_history, 'structured_pruned', PLOTS_DIR)
+    structured_models = {}
+    for suffix, sparsity in PRUNING_CONFIGS:
+        tag = get_checkpoint_tag("structured_pruned", suffix)
+        print(f"\n--- Structured Pruning {sparsity*100:.0f}% ---")
+        
+        if is_training_complete(tag, EPOCHS_PRUNE):
+            s_model = create_resnet18()
+            s_model = apply_structured_pruning(s_model, sparsity)
+            load_checkpoint(s_model, optim.Adam(s_model.parameters(), lr=LEARNING_RATE), tag)
+            try: s_history = pd.read_csv(os.path.join(METRICS_DIR, f'structured_pruned{suffix}_metrics.csv')).to_dict(orient='list')
+            except: s_history = None
+        else:
+            s_model = create_resnet18()
+            s_optimizer = optim.Adam(s_model.parameters(), lr=LEARNING_RATE)
+            _, _ = load_checkpoint(s_model, s_optimizer, "baseline")
+            s_model = apply_structured_pruning(s_model, sparsity)
+            s_model, s_history = train(s_model, trainloader, criterion, s_optimizer, EPOCHS_PRUNE, tag=tag, load_if_exists=True)
+            if s_history:
+                pd.DataFrame(s_history).to_csv(os.path.join(METRICS_DIR, f'structured_pruned{suffix}_metrics.csv'), index=False)
+        
+        all_histories[tag] = s_history
+        structured_models[tag] = (s_model, sparsity)
+        if s_history:
+            plot_training_history(s_history, tag, PLOTS_DIR)
 
-    # 3) Global Pruning
+    # 3) Global Pruning - Multiple Sparsity Levels
     print("\n" + "="*80 + "\n=== 3. Global Pruning ===\n" + "="*80)
-    g_model = create_resnet18()
-    g_optimizer = optim.Adam(g_model.parameters(), lr=LEARNING_RATE)
-    _, _ = load_checkpoint(g_model, g_optimizer, "baseline")
-    g_model = apply_global_pruning(g_model, GLOBAL_PRUNE_AMT)
-    if checkpoint_exists("global_pruned"):
-        load_checkpoint(g_model, g_optimizer, "global_pruned")
-        try: g_history = pd.read_csv(os.path.join(METRICS_DIR, 'global_pruned_metrics.csv')).to_dict(orient='list')
-        except: g_history = None
-    else:
-        g_model, g_history = train(g_model, trainloader, criterion, g_optimizer, EPOCHS_PRUNE, tag="global_pruned", load_if_exists=False)
-        pd.DataFrame(g_history).to_csv(os.path.join(METRICS_DIR, 'global_pruned_metrics.csv'), index=False)
-    all_histories['global_pruned'] = g_history
-    plot_training_history(g_history, 'global_pruned', PLOTS_DIR)
+    global_models = {}
+    for suffix, sparsity in PRUNING_CONFIGS:
+        tag = get_checkpoint_tag("global_pruned", suffix)
+        print(f"\n--- Global Pruning {sparsity*100:.0f}% ---")
+        
+        if is_training_complete(tag, EPOCHS_PRUNE):
+            g_model = create_resnet18()
+            g_model = apply_global_pruning(g_model, sparsity)
+            load_checkpoint(g_model, optim.Adam(g_model.parameters(), lr=LEARNING_RATE), tag)
+            try: g_history = pd.read_csv(os.path.join(METRICS_DIR, f'global_pruned{suffix}_metrics.csv')).to_dict(orient='list')
+            except: g_history = None
+        else:
+            g_model = create_resnet18()
+            g_optimizer = optim.Adam(g_model.parameters(), lr=LEARNING_RATE)
+            _, _ = load_checkpoint(g_model, g_optimizer, "baseline")
+            g_model = apply_global_pruning(g_model, sparsity)
+            g_model, g_history = train(g_model, trainloader, criterion, g_optimizer, EPOCHS_PRUNE, tag=tag, load_if_exists=True)
+            if g_history:
+                pd.DataFrame(g_history).to_csv(os.path.join(METRICS_DIR, f'global_pruned{suffix}_metrics.csv'), index=False)
+        
+        all_histories[tag] = g_history
+        global_models[tag] = (g_model, sparsity)
+        if g_history:
+            plot_training_history(g_history, tag, PLOTS_DIR)
 
     # 4) PTQ
     print("\n" + "="*80 + "\n=== 4. PTQ (FX Graph Mode) ===\n" + "="*80)
-    ptq_model = create_resnet18()
     ptq_scripted_path = os.path.join(MODELS_DIR, 'ptq_scripted.pt')
     
     if os.path.exists(ptq_scripted_path):
-        print("  [PTQ] Loading scripted PTQ model.")
+        print("  [PTQ] Loading pre-quantized PTQ model.")
         # For metrics, we need the pre-JIT model, so recreate it
-        ptq_model_for_metrics = create_resnet18()
-        ptq_opt = optim.Adam(ptq_model_for_metrics.parameters(), lr=LEARNING_RATE)
-        _, _ = load_checkpoint(ptq_model_for_metrics, ptq_opt, "baseline")
-        ptq_model_for_metrics = apply_static_quantization(ptq_model_for_metrics, trainloader)
-        ptq_model = ptq_model_for_metrics  # Use pre-JIT for metrics
+        ptq_model = create_resnet18()
+        ptq_opt = optim.Adam(ptq_model.parameters(), lr=LEARNING_RATE)
+        _, _ = load_checkpoint(ptq_model, ptq_opt, "baseline")
+        ptq_model = apply_static_quantization(ptq_model, trainloader)
     else:
+        print("  [PTQ] Creating and quantizing baseline model...")
+        ptq_model = create_resnet18()
         ptq_opt = optim.Adam(ptq_model.parameters(), lr=LEARNING_RATE)
         _, _ = load_checkpoint(ptq_model, ptq_opt, "baseline")
         ptq_model = apply_static_quantization(ptq_model, trainloader)
@@ -739,60 +816,67 @@ def run_experiments():
 
     # 5) QAT
     print("\n" + "="*80 + "\n=== 5. QAT (FX Graph Mode) ===\n" + "="*80)
-    qat_model = create_resnet18()
     qat_scripted_path = os.path.join(MODELS_DIR, 'qat_scripted.pt')
     
-    if os.path.exists(qat_scripted_path) and checkpoint_exists("qat"):
-         print("  [QAT] Checkpoint found. Loading saved QAT model...")
-         # For metrics, recreate from checkpoint (which will load it via apply_qat with load_if_exists=True)
-         qat_model_for_metrics = create_resnet18()
-         qat_opt = optim.Adam(qat_model_for_metrics.parameters(), lr=LEARNING_RATE)
-         _, _ = load_checkpoint(qat_model_for_metrics, qat_opt, "baseline")
-         qat_model_for_metrics, qat_history = apply_qat(qat_model_for_metrics, trainloader, criterion, qat_opt, EPOCHS_QAT, load_if_exists=True)
-         qat_model = qat_model_for_metrics  # Use pre-JIT for metrics
-         try: qat_history = pd.read_csv(os.path.join(METRICS_DIR, 'qat_metrics.csv')).to_dict(orient='list')
-         except: qat_history = None
-    else:
-        print("  [QAT] No checkpoint found. Training QAT from scratch...")
+    if is_training_complete("qat", EPOCHS_QAT):
+        print("  [QAT] Loading pre-trained QAT model...")
+        qat_model = create_resnet18()
         qat_opt = optim.Adam(qat_model.parameters(), lr=LEARNING_RATE)
         _, _ = load_checkpoint(qat_model, qat_opt, "baseline")
-        qat_model, qat_history = apply_qat(qat_model, trainloader, criterion, qat_opt, EPOCHS_QAT, load_if_exists=False)
-        pd.DataFrame(qat_history).to_csv(os.path.join(METRICS_DIR, 'qat_metrics.csv'), index=False)
+        qat_model, qat_history = apply_qat(qat_model, trainloader, criterion, qat_opt, EPOCHS_QAT, load_if_exists=True)
+        try: qat_history = pd.read_csv(os.path.join(METRICS_DIR, 'qat_metrics.csv')).to_dict(orient='list')
+        except: qat_history = None
+    else:
+        print("  [QAT] Training QAT from checkpoint...")
+        qat_model = create_resnet18()
+        qat_opt = optim.Adam(qat_model.parameters(), lr=LEARNING_RATE)
+        _, _ = load_checkpoint(qat_model, qat_opt, "baseline")
+        qat_model, qat_history = apply_qat(qat_model, trainloader, criterion, qat_opt, EPOCHS_QAT, load_if_exists=True)
+        if qat_history:
+            pd.DataFrame(qat_history).to_csv(os.path.join(METRICS_DIR, 'qat_metrics.csv'), index=False)
         torch.jit.save(torch.jit.script(qat_model), qat_scripted_path)
     all_histories['qat'] = qat_history
     plot_training_history(qat_history, 'qat', PLOTS_DIR)
 
-    # 6) Combined - FIXED VERSION (Keep pruning masks for sparsity measurement)
-    print("\n" + "="*80 + "\n=== 6. Combined: Structured + PTQ (FIXED) ===\n" + "="*80)
-    combined_model = create_resnet18()
-    combined_quant_saved = os.path.join(MODELS_DIR, 'combined_struct_pruned_ptq_scripted.pt')
-    
-    # We need TWO versions:
-    # 1. Pruned version WITH masks for sparsity calculation
-    # 2. Dense quantized version for actual inference
-    
-    combined_pruned = create_resnet18()
-    c_opt = optim.Adam(combined_pruned.parameters(), lr=LEARNING_RATE)
-    
-    if not checkpoint_exists("structured_pruned"):
-        raise RuntimeError("Structured pruned checkpoint missing.")
-    
-    # Load pruned model WITH masks (for sparsity measurement)
-    combined_pruned = apply_structured_pruning(combined_pruned, STRUCT_PRUNE_AMT)
-    load_checkpoint(combined_pruned, c_opt, "structured_pruned")
-    
-    # Create quantized version
-    if os.path.exists(combined_quant_saved):
-        print("  [Combined] Loading existing combined PTQ model.")
-        combined_quantized = torch.jit.load(combined_quant_saved)
-    else:
-        print("  [Combined] Creating dense version for quantization...")
+    # 6) Combined - Multiple Sparsity Levels
+    print("\n" + "="*80 + "\n=== 6. Combined: Structured + PTQ ===\n" + "="*80)
+    combined_models = {}
+    for suffix, sparsity in PRUNING_CONFIGS:
+        tag = get_checkpoint_tag("combined", suffix)
+        struct_tag = get_checkpoint_tag("structured_pruned", suffix)
+        print(f"\n--- Combined (Structured {sparsity*100:.0f}% + PTQ) ---")
+        
+        combined_quant_saved = os.path.join(MODELS_DIR, f'combined_struct_pruned_ptq_scripted{suffix}.pt')
+        
+        # Check if combined model quantization is already complete
+        if os.path.exists(combined_quant_saved):
+            print(f"  [Combined] Pre-quantized model found. Skipping quantization...")
+            # Load pruned model WITH masks (for sparsity measurement)
+            combined_pruned = create_resnet18()
+            combined_pruned = apply_structured_pruning(combined_pruned, sparsity)
+            load_checkpoint(combined_pruned, optim.Adam(combined_pruned.parameters(), lr=LEARNING_RATE), struct_tag)
+            combined_models[tag] = (combined_pruned, None, sparsity)
+            all_histories[tag] = all_histories.get(struct_tag)
+            continue
+        
+        # Otherwise, create quantized version
+        if not checkpoint_exists(struct_tag):
+            print(f"  [Combined] Structured pruned checkpoint {struct_tag} missing. Skipping...")
+            continue
+        
+        print(f"  [Combined] Creating quantized version...")
+        # Load pruned model WITH masks (for sparsity measurement)
+        combined_pruned = create_resnet18()
+        combined_pruned = apply_structured_pruning(combined_pruned, sparsity)
+        load_checkpoint(combined_pruned, optim.Adam(combined_pruned.parameters(), lr=LEARNING_RATE), struct_tag)
+        
+        # Create dense version for quantization
         dense_model = create_resnet18()
-        dense_model = apply_structured_pruning(dense_model, STRUCT_PRUNE_AMT)
-        load_checkpoint(dense_model, optim.Adam(dense_model.parameters()), "structured_pruned")
+        dense_model = apply_structured_pruning(dense_model, sparsity)
+        load_checkpoint(dense_model, optim.Adam(dense_model.parameters()), struct_tag)
         
         # Remove masks from dense version for FX compatibility
-        print("  [Combined] Removing pruning masks for FX compatibility...")
+        print(f"  [Combined] Removing pruning masks for FX compatibility...")
         for name, module in dense_model.named_modules():
             if hasattr(module, 'weight') and isinstance(module, nn.Conv2d):
                 try: 
@@ -800,91 +884,98 @@ def run_experiments():
                 except: 
                     pass
         
-        # Quantize the dense version
-        combined_quantized = apply_static_quantization(dense_model, trainloader)
-        torch.jit.save(torch.jit.script(combined_quantized), combined_quant_saved)
+        # Quantize the dense version - use pre-JIT FX for metrics
+        combined_quantized_fx = apply_static_quantization(dense_model, trainloader)
+        combined_quantized = combined_quantized_fx
+        torch.jit.save(torch.jit.script(combined_quantized_fx), combined_quant_saved)
+        
+        combined_models[tag] = (combined_pruned, combined_quantized, sparsity)
+        all_histories[tag] = all_histories.get(struct_tag)
     
-    # For evaluation, we'll use the quantized version but report sparsity from pruned version
-    combined_model = combined_quantized
-    combined_pruned_for_sparsity = combined_pruned  # Keep this for sparsity calculation
+    # 7) Metrics & Plots
+    print("\n" + "="*80 + "\n=== Collecting Final Metrics ===\n" + "="*80)
     
-    all_histories['combined'] = all_histories.get('structured_pruned')
+    # Build final models dictionary for metrics collection
+    final_models = {}
+    final_models_sparsity = {}
     
-    # 7) Metrics & Plots - FIXED VERSION
-    print("\n" + "="*80 + "\n=== Collecting Final Metrics (FIXED) ===\n" + "="*80)
-    
-    # Reload models - KEEP pruning masks on pruned models for proper sparsity measurement
+    # Baseline
     baseline_final = create_resnet18()
     load_checkpoint(baseline_final, optim.Adam(baseline_final.parameters()), "baseline")
+    final_models['baseline'] = baseline_final
+    final_models_sparsity['baseline'] = baseline_final
     
-    # Structured: load WITH wrapper to keep masks
-    s_final = create_resnet18()
-    s_final = apply_structured_pruning(s_final, STRUCT_PRUNE_AMT)
-    load_checkpoint(s_final, optim.Adam(s_final.parameters()), "structured_pruned")
-    # DON'T remove masks - we need them for sparsity calculation
+    # Structured pruning variants
+    for suffix, sparsity in PRUNING_CONFIGS:
+        tag = get_checkpoint_tag("structured_pruned", suffix)
+        s_final = create_resnet18()
+        s_final = apply_structured_pruning(s_final, sparsity)
+        load_checkpoint(s_final, optim.Adam(s_final.parameters()), tag)
+        final_models[tag] = s_final
+        final_models_sparsity[tag] = s_final
     
-    # Global: load WITH wrapper
-    g_final = create_resnet18()
-    g_final = apply_global_pruning(g_final, GLOBAL_PRUNE_AMT)
-    load_checkpoint(g_final, optim.Adam(g_final.parameters()), "global_pruned")
-    # DON'T remove masks - we need them for sparsity calculation
+    # Global pruning variants
+    for suffix, sparsity in PRUNING_CONFIGS:
+        tag = get_checkpoint_tag("global_pruned", suffix)
+        g_final = create_resnet18()
+        g_final = apply_global_pruning(g_final, sparsity)
+        load_checkpoint(g_final, optim.Adam(g_final.parameters()), tag)
+        final_models[tag] = g_final
+        final_models_sparsity[tag] = g_final
 
-    # PTQ: Recreate the quantized model (DON'T use JIT scripted version for metrics)
+    # PTQ
     print("\n  [PTQ] Recreating quantized model for metrics...")
     ptq_final = create_resnet18()
     ptq_opt = optim.Adam(ptq_final.parameters(), lr=LEARNING_RATE)
     _, _ = load_checkpoint(ptq_final, ptq_opt, "baseline")
     ptq_final = apply_static_quantization(ptq_final, trainloader)
+    final_models['ptq'] = ptq_final
+    final_models_sparsity['ptq'] = ptq_final
     
-    # QAT: Recreate the quantized model (DON'T use JIT scripted version for metrics)
+    # QAT
     print("\n  [QAT] Recreating quantized model for metrics...")
     qat_final = create_resnet18()
     qat_opt = optim.Adam(qat_final.parameters(), lr=LEARNING_RATE)
     _, _ = load_checkpoint(qat_final, qat_opt, "baseline")
     qat_final, _ = apply_qat(qat_final, trainloader, criterion, qat_opt, EPOCHS_QAT, load_if_exists=True)
+    final_models['qat'] = qat_final
+    final_models_sparsity['qat'] = qat_final
     
-    # Combined: Recreate both versions
-    print("\n  [Combined] Recreating combined model for metrics...")
-    # Version 1: WITH masks for sparsity measurement
-    combined_pruned_final = create_resnet18()
-    combined_pruned_final = apply_structured_pruning(combined_pruned_final, STRUCT_PRUNE_AMT)
-    load_checkpoint(combined_pruned_final, optim.Adam(combined_pruned_final.parameters()), "structured_pruned")
-    
-    # Version 2: Dense quantized for size/latency measurement
-    combined_dense_final = create_resnet18()
-    combined_dense_final = apply_structured_pruning(combined_dense_final, STRUCT_PRUNE_AMT)
-    load_checkpoint(combined_dense_final, optim.Adam(combined_dense_final.parameters()), "structured_pruned")
-    
-    # Remove masks from dense version
-    print("  [Combined] Removing pruning masks for FX compatibility...")
-    for name, module in combined_dense_final.named_modules():
-        if hasattr(module, 'weight') and isinstance(module, nn.Conv2d):
-            try: 
-                prune.remove(module, 'weight')
-            except: 
-                pass
-    
-    # Quantize the dense version (DON'T use JIT scripted version)
-    combined_quantized_final = apply_static_quantization(combined_dense_final, trainloader)
+    # Combined variants
+    print("\n  [Combined] Recreating combined models for metrics...")
+    for suffix, sparsity in PRUNING_CONFIGS:
+        tag = get_checkpoint_tag("combined", suffix)
+        struct_tag = get_checkpoint_tag("structured_pruned", suffix)
+        
+        if struct_tag not in final_models_sparsity:
+            print(f"  [Combined] Skipping {tag} - structured variant not found")
+            continue
+        
+        # Version 1: WITH masks for sparsity measurement
+        combined_pruned_final = create_resnet18()
+        combined_pruned_final = apply_structured_pruning(combined_pruned_final, sparsity)
+        load_checkpoint(combined_pruned_final, optim.Adam(combined_pruned_final.parameters()), struct_tag)
+        final_models_sparsity[tag] = combined_pruned_final
+        
+        # Version 2: Dense quantized for size/latency measurement
+        combined_dense_final = create_resnet18()
+        combined_dense_final = apply_structured_pruning(combined_dense_final, sparsity)
+        load_checkpoint(combined_dense_final, optim.Adam(combined_dense_final.parameters()), struct_tag)
+        
+        # Remove masks from dense version
+        for name, module in combined_dense_final.named_modules():
+            if hasattr(module, 'weight') and isinstance(module, nn.Conv2d):
+                try: 
+                    prune.remove(module, 'weight')
+                except: 
+                    pass
+        
+        # Quantize the dense version (use pre-JIT FX for metrics)
+        combined_quantized_final = apply_static_quantization(combined_dense_final, trainloader)
+        final_models[tag] = combined_quantized_final
 
-    models_dict = {
-        "baseline": baseline_final,
-        "structured_pruned": s_final,
-        "global_pruned": g_final,
-        "ptq": ptq_final,
-        "qat": qat_final,
-        "combined": combined_quantized_final
-    }
-    
-    # Special: track the pruned version of combined for sparsity
-    models_sparsity_dict = {
-        "baseline": baseline_final,
-        "structured_pruned": s_final,
-        "global_pruned": g_final,
-        "ptq": ptq_final,
-        "qat": qat_final,
-        "combined": combined_pruned_final  # Use pruned version for sparsity
-    }
+    models_dict = final_models
+    models_sparsity_dict = final_models_sparsity
 
     for name, model in models_dict.items():
         print(f"\n{'='*80}")
@@ -917,7 +1008,7 @@ def run_experiments():
         
         # Add note about latency for pruned models
         if 'pruned' in name:
-            print(f"\n  ⚠️  NOTE: Latency may be HIGHER than baseline due to masking overhead.")
+            print(f"\n    NOTE: Latency may be HIGHER than baseline due to masking overhead.")
             print(f"      PyTorch pruning uses masking (weight = weight_orig * mask), not removal.")
             print(f"      For actual speedup, specialized sparse kernels or hardware is needed.")
         
@@ -1012,16 +1103,6 @@ def run_experiments():
     print(f"- Plots: {PLOTS_DIR}")
     print(f"- Metrics: {METRICS_DIR}")
     print(f"- Checkpoints: {CHECKPOINT_DIR}")
-    print("\nIMPORTANT NOTES:")
-    print("1. Sparsity values should now correctly show ~20% for pruned models")
-    print("2. Parameter counts should be accurate for all model types")
-    print("3. Latency for pruned models may be HIGHER than baseline due to masking overhead")
-    print("4. For actual inference speedup, consider:")
-    print("   - Using sparse tensor formats (torch.sparse)")
-    print("   - Specialized sparse computation libraries (Intel DNNL, NVIDIA cuSPARSE)")
-    print("   - Hardware with native sparse support")
-    print("   - Model export formats that support sparsity (ONNX, TensorRT)")
-    print("="*80)
 
 if __name__ == "__main__":
     run_experiments()
